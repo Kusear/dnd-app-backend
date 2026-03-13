@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"dnd-backend-go/api/env"
 	"dnd-backend-go/internal/client"
 	"dnd-backend-go/internal/commands"
 	"dnd-backend-go/internal/handlers"
@@ -18,11 +19,15 @@ import (
 	"gorm.io/gorm"
 )
 
-const APP_PORT int = 3000
-
 func main() {
 	var router *chi.Mux = chi.NewRouter()
 	slog.SetLogLoggerLevel(slog.LevelDebug)
+
+	var APP_PORT string
+	APP_PORT = env.APP_PORT.GetValue()
+	if APP_PORT == "" {
+		APP_PORT = "3000"
+	}
 
 	// dbPool, err := initDatabase()
 	// if err != nil {
@@ -41,14 +46,14 @@ func main() {
 
 	// Command router is used to execute commands from the client
 	commandRouter := client.NewCommandRouter()
-	commandRouter.RegisterCommand(commands.NewTestCommand())
+	registerCommands(commandRouter)
 
 	handlers.RegisterHandlers(router, hub, commandRouter)
 
 	slog.Info("Database initialized")
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf("localhost:%d", APP_PORT),
+		Addr:    fmt.Sprintf("localhost:%s", APP_PORT),
 		Handler: router,
 	}
 	go func() {
@@ -58,7 +63,7 @@ func main() {
 		}
 	}()
 
-	slog.Info(fmt.Sprintf("Server started at %d port...", APP_PORT))
+	slog.Info(fmt.Sprintf("Server started at %s ", srv.Addr))
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -100,4 +105,15 @@ func runMigrations(db *gorm.DB) error {
 
 	// fmt.Println("Migrations run successfully")
 	return nil
+}
+
+func registerCommands(commandRouter *client.CommandRouter) {
+	err := commandRouter.RegisterCommand(commands.NewTestCommand())
+	err = commandRouter.RegisterCommand(commands.NewTokenAddedCommand())
+	err = commandRouter.RegisterCommand(commands.NewTokenMovedCommand())
+	err = commandRouter.RegisterCommand(commands.NewMapChangedCommand())
+	if err != nil {
+		slog.Error("Error registering commands:", "error", err)
+		panic(err)
+	}
 }

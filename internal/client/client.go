@@ -2,7 +2,8 @@ package client
 
 import (
 	"dnd-backend-go/internal/common"
-	"encoding/json"
+	"dnd-backend-go/internal/utils"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -26,18 +27,19 @@ const (
 type WsClient struct {
 	hub *Hub
 
-	conn *websocket.Conn
-	send chan []byte
+	conn     *websocket.Conn
+	send     chan []byte
+	sendJson chan map[string]any
 
 	commandRouter *CommandRouter
 }
 
 func InitClient(wsConn *websocket.Conn, hub *Hub, commandRouter *CommandRouter) *WsClient {
-	slog.Info("Initializing new WebSocket client")
 	client := &WsClient{
 		hub:           hub,
 		conn:          wsConn,
 		send:          make(chan []byte),
+		sendJson:      make(chan map[string]any),
 		commandRouter: commandRouter,
 	}
 
@@ -48,27 +50,6 @@ func InitClient(wsConn *websocket.Conn, hub *Hub, commandRouter *CommandRouter) 
 	go client.WriteMessages()
 
 	return client
-}
-
-// Converts a map[string]any to a JSON byte array
-func (obj *WsClient) convertMessageToJson(parsedMessage map[string]any) ([]byte, error) {
-	jsonMessage, err := json.Marshal(parsedMessage)
-	if err != nil {
-		slog.Error("error: " + err.Error())
-		return nil, err
-	}
-	return jsonMessage, nil
-}
-
-// Converts a JSON byte array to a map[string]any
-func (obj *WsClient) convertJsonToMessage(jsonMessage []byte) (map[string]any, error) {
-	var parsedMessage map[string]any
-	err := json.Unmarshal(jsonMessage, &parsedMessage)
-	if err != nil {
-		slog.Error("error: " + err.Error())
-		return nil, err
-	}
-	return parsedMessage, nil
 }
 
 // Listens for messages from the WebSocket connection.
@@ -83,8 +64,11 @@ func (obj *WsClient) ListenMessages() {
 	obj.conn.SetReadDeadline(time.Now().Add(pongWait))
 	obj.conn.SetPongHandler(func(string) error { obj.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 	for {
+		// change to ReadJSON
 		mt, message, err := obj.conn.ReadMessage()
 
+		// TODO sync req-res log messages
+		slog.Info("Reading message", "message type", mt, "message", message)
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				slog.Error("Error reading message:" + err.Error())
@@ -92,12 +76,13 @@ func (obj *WsClient) ListenMessages() {
 			break
 		}
 
+		requestUid := utils.RandomString(10)
 		obj.conn.SetReadDeadline(time.Now().Add(pongWait))
 		obj.conn.SetPongHandler(func(string) error { obj.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 
-		slog.Info("Message received:", "message type", mt, "message", message)
+		slog.Info(fmt.Sprintf("[rId: %s] (message type = %d) Message: %s", requestUid, mt, message))
 
-		parsedMessage, err := obj.convertJsonToMessage(message)
+		parsedMessage, err := utils.ConvertJsonToMessage(message)
 		if err != nil {
 			slog.Error("error: " + err.Error())
 			// TODO add error response to the client (400)
@@ -106,32 +91,55 @@ func (obj *WsClient) ListenMessages() {
 
 		parsedMessage["type"] = "response"
 
-		err = obj.commandRouter.ValidatePayload(parsedMessage)
+		err = obj.commandRouter.ValidateBasicPayload(parsedMessage)
 		if err != nil {
 			slog.Error("error: " + err.Error())
 			// TODO add error response to the client (400)
 			continue
 		}
 
-		response, err := obj.commandRouter.ExecuteCommand(obj, common.Infrastructure{}, parsedMessage["command"].(string), parsedMessage["data"].(map[string]any))
-		if err != nil {
-			slog.Error("error: " + err.Error())
-			// TODO add error response to the client (can be custom error message)
-			continue
-		}
+		// Execute command in a separate goroutine to avoid blocking other requests
+		go func() {
+			command, err := obj.commandRouter.GetCommand(parsedMessage["command"].(string))
+			if err != nil {
+				slog.Error("error: " + err.Error())
+				obj.SendErrorResponse(common.NotFoundError, err.Error())
+				return
+			}
 
-		jsonMessage, err := obj.convertMessageToJson(response)
-		if err != nil {
-			slog.Error("error: " + err.Error())
-			// TODO add error response to the client (500)
-			continue
-		}
+			err = command.ValidatePayload(parsedMessage["data"].(map[string]any))
+			if err != nil {
+				slog.Error("error: " + err.Error())
+				obj.SendErrorResponse(common.BadRequestError, err.Error())
+				return
+			}
 
-		if len(jsonMessage) == 0 {
-			continue
-		}
+			response, err := command.Execute(obj, common.Infrastructure{}, parsedMessage["data"].(map[string]any))
+			// response, err := obj.commandRouter.ExecuteCommand(obj, common.Infrastructure{}, parsedMessage["command"].(string), parsedMessage["data"].(map[string]any))
+			if err != nil {
+				slog.Error("error: " + err.Error())
+				// TODO add error response to the client (can be custom error message)
+				obj.SendErrorResponse(common.BadRequestError, err.Error())
+				return
+			}
 
-		obj.Send(jsonMessage)
+			// jsonMessage, err := utils.ConvertMessageToJson(response)
+			// if err != nil {
+			// 	slog.Error("error: " + err.Error())
+			// 	// TODO add error response to the client (500)
+			// 	return
+			// }
+
+			if response == nil {
+				slog.Info("No response to send to client")
+				return
+			}
+
+			slog.Info(fmt.Sprintf("[rId: %s] Sending response to client", requestUid), response)
+
+			obj.SendJson(response.(map[string]any))
+		}()
+
 	}
 }
 
@@ -149,7 +157,13 @@ func (obj *WsClient) WriteMessages() {
 		case message := <-obj.send:
 			err := obj.conn.WriteMessage(websocket.TextMessage, message)
 			if err != nil {
-				slog.Error("Error writing message:", err)
+				slog.Error("Error writing message:", "error", err)
+				return
+			}
+		case message := <-obj.sendJson:
+			err := obj.conn.WriteJSON(message)
+			if err != nil {
+				slog.Error("Error writing message:", "error", err)
 				return
 			}
 		case <-ticker.C:
@@ -163,4 +177,35 @@ func (obj *WsClient) WriteMessages() {
 
 func (obj *WsClient) Send(message []byte) {
 	obj.send <- message
+}
+
+func (obj *WsClient) SendJson(message map[string]any) {
+	obj.sendJson <- message
+}
+
+func (obj *WsClient) BroadcastToHub(message []byte) {
+	obj.hub.Broadcast(message)
+}
+
+func (obj *WsClient) BroadcastToHubJson(message map[string]any) {
+	obj.hub.BroadcastJson(message)
+}
+
+func (obj *WsClient) BroadcastToHubExceptCurrentClient(message []byte) {
+	obj.hub.BroadcastExceptCurrentClient(message, obj)
+}
+
+func (obj *WsClient) BroadcastToHubExceptCurrentClientJson(message map[string]any) {
+	obj.hub.BroadcastJsonExceptCurrentClient(message, obj)
+}
+
+func (obj *WsClient) SendErrorResponse(errorType common.ErrorType, message string) {
+	// jsonMessage, err := utils.ConvertMessageToJson(errorType.GetErrorMessage(message))
+	// if err != nil {
+	// 	slog.Error("error: " + err.Error())
+	// 	return
+	// }
+	// obj.Send(jsonMessage)
+
+	obj.sendJson <- errorType.GetErrorMessage(message)
 }

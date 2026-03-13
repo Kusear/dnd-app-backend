@@ -7,8 +7,9 @@ import (
 )
 
 type Command struct {
-	Name    string
-	Execute func(ctx *WsClient, infrastructure common.Infrastructure, params map[string]any) (map[string]any, error)
+	Name            string
+	Execute         func(socket *WsClient, infrastructure common.Infrastructure, params map[string]any) (interface{}, error)
+	ValidatePayload func(payload map[string]any) error
 }
 
 type CommandRouter struct {
@@ -21,7 +22,7 @@ func NewCommandRouter() *CommandRouter {
 	}
 }
 
-func (obj *CommandRouter) ValidatePayload(payload map[string]any) error {
+func (obj *CommandRouter) ValidateBasicPayload(payload map[string]any) error {
 	if payload["command"] == nil {
 		return errors.New("command is required")
 	}
@@ -43,13 +44,30 @@ func (obj *CommandRouter) RegisterCommand(command *Command) error {
 	}
 
 	obj.commands[command.Name] = command
+	slog.Info("Command registered:", "command", command.Name)
 	return nil
 }
 
-func (obj *CommandRouter) ExecuteCommand(ctx *WsClient, infrastructure common.Infrastructure, name string, params map[string]any) (map[string]any, error) {
+func (obj *CommandRouter) GetCommand(name string) (*Command, error) {
 	command := obj.commands[name]
 	if command == nil {
 		return nil, errors.New("command not found")
 	}
-	return command.Execute(ctx, infrastructure, params)
+	return command, nil
+}
+
+// func (obj *CommandRouter) ValidateCommandPayload(command *Command, params map[string]any) error {
+// 	return command.ValidatePayload(params)
+// }
+
+func (obj *CommandRouter) ExecuteCommand(socket *WsClient, infrastructure common.Infrastructure, name string, params map[string]any) (interface{}, error) {
+	command, err := obj.GetCommand(name)
+	if err != nil {
+		return nil, err
+	}
+	response, err := command.Execute(socket, infrastructure, params)
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
 }
